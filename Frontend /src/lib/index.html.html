@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Shortly — single-file URL shortener (client-side)</title>
+<style>
+  :root{font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial; --accent:#4f46e5;}
+  body{margin:0;background:#f6f7fb;color:#0f172a;padding:24px;box-sizing:border-box;}
+  .wrap{max-width:960px;margin:0 auto;background:#fff;border-radius:12px;padding:20px 22px;box-shadow:0 8px 30px rgba(21,24,40,0.06)}
+  h1{margin:0 0 6px;font-size:22px}
+  p.lead{margin:0 0 18px;color:#475569}
+  form{display:flex;gap:8px;flex-wrap:wrap}
+  input[type=url], input[type=text]{flex:1;padding:10px;border:1px solid #e6e9ef;border-radius:8px}
+  .btn{background:var(--accent);color:#fff;padding:10px 14px;border-radius:8px;border:0;cursor:pointer}
+  .secondary{background:#eef2ff;color:var(--accent);border:1px solid rgba(79,70,229,0.12)}
+  .muted{color:#64748b;font-size:13px}
+  table{width:100%;border-collapse:collapse;margin-top:18px}
+  th,td{padding:10px 8px;text-align:left;border-bottom:1px solid #f1f5f9;font-size:14px}
+  th{color:#334155;font-weight:600;font-size:13px}
+  .actions button{margin-right:6px}
+  code.badge{background:#f1f5f9;padding:4px 8px;border-radius:6px;font-family:monospace}
+  .small{font-size:13px;color:#334155}
+  .top-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+  .right{margin-left:auto;display:flex;gap:8px}
+  .note{background:#fff7ed;border-left:4px solid #f59e0b;padding:10px;border-radius:6px;color:#92400e}
+  @media (max-width:640px){th,td{font-size:13px} .right{width:100%;justify-content:stretch}}
+</style>
+</head>
+<body>
+<div class="wrap" role="main">
+  <div class="top-row">
+    <div>
+      <h1>Shortly</h1>
+      <p class="lead">Shorten a URL and keep a history. Works entirely in your browser (localStorage).</p>
+    </div>
+    <div class="right">
+      <button id="exportBtn" class="secondary">Export JSON</button>
+      <button id="importBtn" class="secondary">Import JSON</button>
+      <button id="clearAllBtn" class="secondary">Clear All</button>
+    </div>
+  </div>
+
+  <div class="note" id="note">
+    Tip: The short link is this page's URL + <code>#r=CODE</code>. Host this file somewhere public (e.g. GitHub Pages) to make short links shareable.
+  </div>
+
+  <form id="shortenForm" style="margin-top:14px" onsubmit="return false;">
+    <input id="longUrl" type="url" placeholder="Enter or paste a long URL (include https://)" required />
+    <input id="customAlias" type="text" placeholder="Optional custom alias (alphanumeric - 3..40 chars)" style="max-width:260px" />
+    <button id="shortenBtn" class="btn">Shorten</button>
+  </form>
+  <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <div class="muted">History (previous work) is stored locally in this browser.</div>
+    <div style="flex:1"></div>
+    <div class="muted small">Local entries: <span id="count">0</span></div>
+  </div>
+
+  <table id="history" aria-live="polite" style="margin-top:12px">
+    <thead>
+      <tr><th>Short</th><th>Original URL</th><th>Created</th><th>Clicks</th><th style="width:200px">Actions</th></tr>
+    </thead>
+    <tbody id="historyBody">
+      <!-- populated by JS -->
+    </tbody>
+  </table>
+
+  <div style="margin-top:16px;color:#475569;font-size:13px">
+    <strong>How it works:</strong> The app stores mappings from short code → original URL in your browser's <code>localStorage</code>. When this page is opened with <code>#r=CODE</code>, it will automatically redirect to the saved URL and increment a local click counter.
+  </div>
+</div>
+
+<!-- Hidden file input for import -->
+<input type="file" id="importFile" accept="application/json" style="display:none" />
+
+<script>
+/* Shortly — single-file client-side shortener
+   Storage key: shortly_mappings (JSON object keyed by code)
+   Each record: { url, createdISO, clicks, alias(optional) }
+*/
+
+// ===== helpers =====
+const STORAGE_KEY = 'shortly_mappings_v1';
+const CODE_MIN_LEN = 4;
+
+function saveAll(obj){
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(obj));
+}
+function loadAll(){
+  try {
+    return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+  } catch(e){
+    return {};
+  }
+}
+function nowISO(){ return new Date().toISOString(); }
+
+function base62(num){
+  const chars = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  let s = '';
+  if (num === 0) return '0';
+  while(num>0){
+    s = chars[num % 62] + s;
+    num = Math.floor(num/62);
+  }
+  return s;
+}
+function randomCode(){
+  // timestamp + random -> base62
+  const t = Date.now(); // ms
+  const r = Math.floor(Math.random()*999999);
+  const n = parseInt(String(t).slice(-8)) * 1000000 + r;
+  return base62(n).slice(0,8);
+}
+
+function isValidAlias(a){
+  if(!a) return false;
+  return /^[A-Za-z0-9_-]{3,40}$/.test(a);
+}
+
+function getPageBase(){
+  // current page without hash and query
+  return window.location.href.split('#')[0].split('?')[0];
+}
+
+// ===== UI =====
+const longInput = document.getElementById('longUrl');
+const aliasInput = document.getElementById('customAlias');
+const shortenBtn = document.getElementById('shortenBtn');
+const historyBody = document.getElementById('historyBody');
+const countEl = document.getElementById('count');
+const exportBtn = document.getElementById('exportBtn');
+const importBtn = document.getElementById('importBtn');
+const importFile = document.getElementById('importFile');
+const clearAllBtn = document.getElementById('clearAllBtn');
+
+function renderHistory(){
+  const data = loadAll();
+  const keys = Object.keys(data).sort((a,b)=> new Date(data[b].createdISO) - new Date(data[a].createdISO));
+  historyBody.innerHTML = '';
+  keys.forEach(code=>{
+    const rec = data[code];
+    const shortHref = getPageBase() + '#r=' + encodeURIComponent(code);
+    const tr = document.createElement('tr');
+
+    const tdShort = document.createElement('td');
+    tdShort.innerHTML = `<code class="badge">${code}</code><div class="small" style="margin-top:6px"><a href="${shortHref}" target="_blank" rel="noopener noreferrer">${shortHref}</a></div>`;
+
+    const tdOrig = document.createElement('td');
+    tdOrig.innerHTML = `<div style="max-width:460px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><a href="${rec.url}" target="_blank" rel="noopener noreferrer">${rec.url}</a></div>`;
+
+    const tdCreated = document.createElement('td');
+    const d = new Date(rec.createdISO);
+    tdCreated.textContent = d.toLocaleString();
+
+    const tdClicks = document.createElement('td');
+    tdClicks.textContent = rec.clicks || 0;
+
+    const tdActions = document.createElement('td');
+    tdActions.className = 'actions';
+    tdActions.innerHTML = `
+      <button class="secondary" data-action="copy" data-code="${code}">Copy</button>
+      <button class="secondary" data-action="open" data-code="${code}">Open</button>
+      <button class="secondary" data-action="qr" data-code="${code}">QR</button>
+      <button style="background:#ef4444;color:#fff;border:0;padding:8px;border-radius:6px" data-action="delete" data-code="${code}">Delete</button>
+    `;
+
+    tr.appendChild(tdShort);
+    tr.appendChild(tdOrig);
+    tr.appendChild(tdCreated);
+    tr.appendChild(tdClicks);
+    tr.appendChild(tdActions);
+    historyBody.appendChild(tr);
+  });
+
+  countEl.textContent = keys.length;
+}
+
+// shortn action
+function shortenURL(){
+  const long = longInput.value.trim();
+  if(!long) { alert('Please enter a URL (include https://)'); return; }
+  try {
+    // basic validation
+    const urlObj = new URL(long);
+    if(!['http:','https:'].includes(urlObj.protocol)){
+      alert('Only http(s) URLs are supported.');
+      return;
+    }
+  } catch(e){
+    alert('Invalid URL. Make sure it starts with http:// or https://');
+    return;
+  }
+  let alias = aliasInput.value.trim();
+  const all = loadAll();
+
+  if(alias){
+    if(!isValidAlias(alias)){
+      alert('Alias must be 3–40 characters, letters, numbers, underscore or hyphen only.');
+      return;
+    }
+    if(all[alias]){
+      alert('That alias is already taken. Choose a different one.');
+      return;
+    }
+  } else {
+    // generate new unique code
+    let tries = 0;
+    do {
+      alias = randomCode();
+      tries++;
+      if(tries>20) alias += Math.floor(Math.random()*999).toString(36);
+    } while(all[alias]);
+  }
+
+  all[alias] = { url: long, createdISO: nowISO(), clicks: 0, alias: alias };
+  saveAll(all);
+  renderHistory();
+
+  // show short URL to user and select it for copying
+  const shortHref = getPageBase() + '#r=' + encodeURIComponent(alias);
+  prompt('Short link (copy):', shortHref);
+
+  // clear inputs but keep long for convenience
+  //longInput.value = '';
+  aliasInput.value = '';
+}
+
+// history button handlers (copy/open/delete)
+historyBody.addEventListener('click', (ev)=>{
+  const btn = ev.target.closest('button');
+  if(!btn) return;
+  const action = btn.getAttribute('data-action');
+  const code = btn.getAttribute('data-code');
+  const all = loadAll();
+  if(!all[code]) { alert('Record not found.'); renderHistory(); return; }
+
+  const shortHref = getPageBase() + '#r=' + encodeURIComponent(code);
+
+  if(action === 'copy'){
+    navigator.clipboard?.writeText(shortHref).then(()=> {
+      btn.textContent = 'Copied!';
+      setTimeout(()=>btn.textContent='Copy',900);
+    }).catch(()=> {
+      prompt('Copy this short URL:', shortHref);
+    });
+  } else if(action === 'open'){
+    window.open(shortHref, '_blank', 'noopener');
+  } else if(action === 'delete'){
+    if(confirm('Delete this shortened link? This cannot be undone.')){
+      delete all[code];
+      saveAll(all);
+      renderHistory();
+    }
+  } else if(action === 'qr'){
+    // open a small QR dialog using data: URL to Google Chart is deprecated; instead use a simple inline QR via canvas libs is heavy.
+    // We'll open a new window with the short link and a simple QR fallback (using Google Charts is still available in many places).
+    const w = window.open('', '_blank', 'width=420,height=460');
+    const esc = encodeURIComponent(shortHref);
+    // Use Google Chart API for QR codes (large compatibility). If blocked, user can copy link.
+    w.document.write(`<title>QR for ${code}</title>
+      <div style="font-family:system-ui;padding:12px">
+        <h3>QR for <code>${code}</code></h3>
+        <img src="https://chart.googleapis.com/chart?cht=qr&chs=300x300&chl=${esc}" alt="QR">
+        <p><a href="${shortHref}" target="_blank">Open link</a></p>
+      </div>`);
+    w.document.close();
+  }
+});
+
+// export
+exportBtn.addEventListener('click', ()=>{
+  const all = loadAll();
+  const blob = new Blob([JSON.stringify(all, null, 2)], {type: 'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'shortly_export.json';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url), 2000);
+});
+
+// import
+importBtn.addEventListener('click', ()=> importFile.click());
+importFile.addEventListener('change', async (ev)=>{
+  const file = ev.target.files[0];
+  if(!file) return;
+  try {
+    const text = await file.text();
+    const parsed = JSON.parse(text);
+    if(typeof parsed !== 'object' || parsed === null){ throw new Error('Invalid JSON');}
+    const current = loadAll();
+    // merge carefully: do not overwrite by default. Ask user to confirm by prompt style (can't ask during file load). We'll merge by keeping existing keys and adding new ones;
+    let overwritten = 0, added = 0;
+    Object.keys(parsed).forEach(k=>{
+      if(current[k]) overwritten++;
+      else added++;
+      current[k] = parsed[k];
+    });
+    saveAll(current);
+    renderHistory();
+    alert(`Import complete. Added: ${added}. Overwritten: ${overwritten}.`);
+  } catch(e){
+    alert('Failed to import JSON: ' + e.message);
+  } finally {
+    importFile.value = '';
+  }
+});
+
+// clear all
+clearAllBtn.addEventListener('click', ()=>{
+  if(confirm('Erase ALL saved shortened links in this browser? This cannot be undone.')){
+    localStorage.removeItem(STORAGE_KEY);
+    renderHistory();
+  }
+});
+
+// handle shorten button
+shortenBtn.addEventListener('click', shortenURL);
+document.getElementById('shortenForm').addEventListener('submit', (e)=>{ e.preventDefault(); shortenURL(); });
+
+// ===== redirect handler =====
+// If the page is opened with #r=CODE, try to redirect automatically.
+function handleRedirectFromHash(){
+  const h = location.hash || '';
+  if(!h) return;
+  const m = h.match(/#r=([^&]+)/);
+  if(!m) return;
+  const code = decodeURIComponent(m[1]);
+  const all = loadAll();
+  const rec = all[code];
+  if(!rec){
+    // show a user-friendly message on the page
+    const note = document.getElementById('note');
+    note.innerHTML = `<strong>Unknown code:</strong> <code>${code}</code> — no matching URL in this copy of the app. If you created the short link on another host/browser, make sure this exact file is the same and the data was imported.`;
+    return;
+  }
+  // increment clicks and redirect with a short delay (so we can update storage)
+  rec.clicks = (rec.clicks || 0) + 1;
+  saveAll(all);
+  // show a tiny page saying redirecting, then redirect
+  document.body.innerHTML = `
+    <div style="font-family:system-ui;padding:40px;text-align:center">
+      <h2>Redirecting…</h2>
+      <p>Code: <code>${code}</code></p>
+      <p>Target: <a href="${rec.url}" id="target" target="_blank" rel="noopener noreferrer">${rec.url}</a></p>
+      <p style="color:#64748b">If you are not redirected automatically, click the link above.</p>
+    </div>
+  `;
+  // small timeout then replace location
+  setTimeout(()=> {
+    // use replace so back button doesn't come back to hash
+    window.location.replace(rec.url);
+  }, 700);
+}
+
+// render at start
+renderHistory();
+handleRedirectFromHash();
+
+</script>
+</body>
+</html>
